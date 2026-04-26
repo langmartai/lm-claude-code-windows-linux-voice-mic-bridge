@@ -4,10 +4,44 @@ Stream a Windows microphone over raw TCP to a Linux machine, where it appears
 as a regular PulseAudio input device (`WindowsMic`) any app — Claude Code
 voice input, browsers, STT tools — can record from.
 
-Built for the case where the Linux machine is reached over SSH (so RDP audio
-redirection isn't an option), and the two hosts share a low-latency network
-(LAN, Hyper-V virtual switch). No SSH tunneling — direct TCP for minimum
-overhead.
+## Primary use case: Claude Code `/voice` from a remote Linux box
+
+You're on Windows, SSHed into an Ubuntu (or other Linux) machine. You run
+Claude Code in that SSH session and want to use the `/voice` command — but
+your microphone is on Windows, and Claude Code needs a *local Linux* audio
+input device to record from. SSH carries no audio, so Claude Code sees no
+microphones at all on the Linux side.
+
+This bridge fixes it. Once installed:
+
+1. Windows streams its mic to the Linux box over raw TCP on the same LAN /
+   Hyper-V virtual switch.
+2. PulseAudio on Linux exposes the incoming stream as a regular input
+   source named `WindowsMic`, set as the **system default**.
+3. Inside your SSH'd Claude Code session, `/voice` records from the default
+   mic — which is now your Windows mic — with zero extra config.
+
+To you it feels like the mic is plugged directly into the Linux box. The
+same setup works for any Linux app that records from the default mic
+(browser STT, `whisper.cpp`, `nerd-dictation`, OBS, etc.).
+
+Design choices flow from this use case:
+
+- **Direct TCP, no SSH tunnel** — both hosts are typically on the same LAN
+  or Hyper-V virtual switch, so encryption is wasted overhead and adds
+  latency.
+- **PulseAudio default source** — so `/voice` and other apps need no
+  per-tool device configuration.
+- **Aggressive auto-recovery** — voice input has to "just work" when you
+  hit `/voice`. The watchdog handles the case where Windows dshow goes
+  zombie after a USB mic disconnect-reconnect, so you don't have to notice
+  or manually intervene.
+
+### Why not RDP audio redirection?
+
+RDP carries audio natively, but you'd be in a remote desktop session, not
+an SSH terminal — different workflow. This bridge keeps you in your
+existing SSH terminal and just makes the mic show up.
 
 ## Architecture
 
