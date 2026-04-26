@@ -14,6 +14,146 @@ this bridge points at the Windows mic.
 Read [README.md](README.md) for the user-facing story; this file is the
 maintainer's lens.
 
+## Working on this project
+
+This section is for a Claude Code session that has been asked to install,
+debug, or modify the bridge. Assume both `~/.config/windowsmic-bridge/config.env`
+and `%USERPROFILE%\.windowsmic-bridge\config.ps1` already exist on the
+respective hosts (otherwise: copy from the `config.example.*` templates and
+ask the user to fill in `WIN_HOST`, `WIN_KEY`, `LinuxHost`).
+
+### Bootstrap a fresh setup
+
+```bash
+# Linux side (run on the Linux box)
+git clone git@github.com:langmartai/lm-claude-code-windows-linux-voice-mic-bridge.git
+cd lm-claude-code-windows-linux-voice-mic-bridge
+bash linux/install.sh
+# then edit ~/.config/windowsmic-bridge/config.env (set WIN_HOST, WIN_KEY)
+systemctl --user restart windowsmic-watchdog.service
+```
+
+```powershell
+# Windows side (elevated PowerShell)
+git clone git@github.com:langmartai/lm-claude-code-windows-linux-voice-mic-bridge.git
+cd lm-claude-code-windows-linux-voice-mic-bridge
+.\windows\install.ps1
+# then edit %USERPROFILE%\.windowsmic-bridge\config.ps1 (set $LinuxHost)
+schtasks /End /TN WindowsMicStream
+schtasks /Run /TN WindowsMicStream
+```
+
+### Quick health check (Linux)
+
+```bash
+# all four should be green
+systemctl --user is-active windowsmic-listen.service windowsmic-watchdog.service
+pactl list short sources | grep WindowsMic
+ss -tn state established '( sport = :9999 )' | tail -n +2
+
+# is the mic actually delivering audio? (≥3s sample, skip 1s startup)
+timeout 4 parecord --device=WindowsMic --file-format=wav /tmp/check.wav 2>/dev/null
+python3 -c "
+import wave, struct, math
+w=wave.open('/tmp/check.wav','rb'); sr=w.getframerate(); skip=int(1.0*sr); n=w.getnframes()
+w.setpos(skip); f=w.readframes(n-skip)
+s=struct.unpack('<'+'h'*(len(f)//2), f) if f else []
+peak=max(abs(x) for x in s) if s else 0
+print(f'peak={peak} ({20*math.log10(peak/32768) if peak>0 else -100:.1f} dBFS)')
+"
+```
+
+A non-zero peak after that python block = stream is healthy. A peak of 0
+with `WindowsMic` listed and TCP established = stuck dshow (the watchdog
+will recover within ~50s).
+
+### Watch the watchdog react
+
+```bash
+journalctl --user -u windowsmic-watchdog.service -f
+# you should see no output during normal operation;
+# silence/recovery events log here when they happen
+```
+
+### Common operations
+
+```bash
+# Linux side: edit a script, redeploy, restart services
+bash linux/install.sh                                       # idempotent
+systemctl --user restart windowsmic-listen.service windowsmic-watchdog.service
+
+# Force-bounce when the user says "voice broke right now":
+# (this also kicks the Windows side via the watchdog's normal path on next cycle,
+#  OR do it directly)
+systemctl --user restart windowsmic-listen.service
+
+# Kick the Windows side over SSH (uses WIN_HOST/WIN_KEY from config.env)
+. ~/.config/windowsmic-bridge/config.env
+ssh -i "$WIN_KEY" "$WIN_HOST" \
+    'powershell -Command "Get-Process ffmpeg -ErrorAction SilentlyContinue | Stop-Process -Force"'
+# the Windows scheduled-task PS loop respawns ffmpeg within ~8s
+
+# Reload pulse config after editing linux/pulse/windowsmic.pa
+sudo install -m 644 linux/pulse/windowsmic.pa /etc/pulse/default.pa.d/
+pulseaudio -k && pulseaudio --start
+```
+
+```powershell
+# Windows side
+schtasks /Query /TN WindowsMicStream /V /FO LIST | Select-String 'Status|Last Run'
+Get-Process ffmpeg | Select-Object Id, StartTime, CPU
+schtasks /End /TN WindowsMicStream     # stop
+schtasks /Run /TN WindowsMicStream     # start
+```
+
+### Modifying the scripts
+
+Iterate on Linux first — it's the side you can SSH into and tail logs from.
+Windows-side changes are slower because every change requires `scp` of the
+new `.ps1` to `C:\windowsmic-bridge\windowsmic.ps1` and a task restart. For
+fast Windows iteration, run the PS1 directly in an interactive PowerShell
+to see ffmpeg's live output, *then* deploy via the scheduled task once the
+logic is right.
+
+After any change to a tracked file, run the credential-leak sweep before
+committing:
+
+```bash
+git diff --cached | grep -E '10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|admin@|/home/[a-z]+|\.ssh/[a-z_-]+_key' && \
+  echo "STOP: possible secret leak above" || echo "clean"
+```
+
+### When the user says "voice doesn't work"
+
+Walk this checklist top-to-bottom — each step is fast (~2s) and rules out
+a layer:
+
+1. `systemctl --user is-active windowsmic-listen.service windowsmic-watchdog.service` — both `active`?
+2. `ss -tn state established '( sport = :9999 )'` — TCP connection from Windows?
+   - **No** → Windows side dead. Check `Get-Process ffmpeg` over SSH, kick task with `schtasks /Run /TN WindowsMicStream`.
+   - **Yes** → continue.
+3. `pactl list short sources | grep WindowsMic` — source exists?
+   - **No** → pulse config didn't load. `sudo install … && pulseaudio -k && pulseaudio --start`.
+   - **Yes** → continue.
+4. Record a 4s sample (snippet above). Peak == 0 with TCP established = sound-card-zombie.
+   - Either wait ~50s for watchdog, OR force it: `systemctl --user restart windowsmic-listen.service` then SSH-kill Windows ffmpeg.
+5. `pactl get-default-source` — is `WindowsMic` the default?
+   - **No** → `pactl set-default-source WindowsMic` (and check pulse config has `set-default-source WindowsMic`).
+6. App-specific: does the app honor pulse default? If not, point it at device `WindowsMic` directly.
+
+### What NOT to do
+
+- Don't add SSH tunneling "just to be safe" — the design assumes LAN/vSwitch.
+  Adding it changes the latency profile; only do it if there's a real reason.
+- Don't switch to a codec (opus, mp3) for "bandwidth" — uncompressed s16le at
+  ~768 kbit/s is fine on a LAN and avoids latency/quality cost.
+- Don't put the device name as a literal string in the PS1 — always pattern
+  match. See "Windows device name has a shifting prefix" below.
+- Don't lower `CHECK_INTERVAL` below ~10s without raising `SAMPLE_SEC`. See
+  "Recovery timing budget" below.
+- Don't run multiple `parecord --device=WindowsMic` clients at once when
+  debugging. See "Concurrent parecord clients" below.
+
 ## Configuration / credential boundary
 
 Real hosts, SSH users, and key paths **never live in the repo**.
