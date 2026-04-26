@@ -1,4 +1,4 @@
-# lm-windows-linux-voice-mic-bridge
+# lm-claude-code-windows-linux-voice-mic-bridge
 
 Stream a Windows microphone over raw TCP to a Linux machine, where it appears
 as a regular PulseAudio input device (`WindowsMic`) any app — Claude Code
@@ -73,8 +73,8 @@ Requires: `pulseaudio` (or compatible), `ffmpeg`, `pactl`, `python3`,
 `systemd --user`.
 
 ```bash
-git clone git@github.com:langmartai/lm-windows-linux-voice-mic-bridge.git
-cd lm-windows-linux-voice-mic-bridge
+git clone git@github.com:langmartai/lm-claude-code-windows-linux-voice-mic-bridge.git
+cd lm-claude-code-windows-linux-voice-mic-bridge
 bash linux/install.sh
 
 # Then set Windows host + SSH key path (used for the watchdog SSH-kill)
@@ -91,8 +91,8 @@ Linux watchdog can SSH-kill).
 In an **elevated** PowerShell:
 
 ```powershell
-git clone git@github.com:langmartai/lm-windows-linux-voice-mic-bridge.git
-cd lm-windows-linux-voice-mic-bridge
+git clone git@github.com:langmartai/lm-claude-code-windows-linux-voice-mic-bridge.git
+cd lm-claude-code-windows-linux-voice-mic-bridge
 .\windows\install.ps1
 
 # Then set the Linux host IP
