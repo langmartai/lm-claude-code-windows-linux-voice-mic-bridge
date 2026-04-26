@@ -1,0 +1,15 @@
+[Unit]
+Description=WindowsMic TCP->PulseAudio listener
+After=pulseaudio.service
+Requires=pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/windowsmic-listen.sh
+Restart=always
+RestartSec=2
+StandardOutput=append:/tmp/windowsmic.log
+StandardError=append:/tmp/windowsmic.log
+
+[Install]
+WantedBy=default.target

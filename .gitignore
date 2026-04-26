@@ -1,0 +1,13 @@
+# Local configs that contain hosts / SSH key paths — never commit.
+config.env
+config.ps1
+*.local.*
+.env
+.env.*
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,15 @@
+[Unit]
+Description=WindowsMic source-level silence watchdog
+After=windowsmic-listen.service
+Wants=windowsmic-listen.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/windowsmic-watchdog.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/windowsmic-watchdog.log
+StandardError=append:/tmp/windowsmic-watchdog.log
+
+[Install]
+WantedBy=default.target
