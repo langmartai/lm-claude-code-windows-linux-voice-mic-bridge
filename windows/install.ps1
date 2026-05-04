@@ -1,13 +1,16 @@
 # Installs the Windows side: copies scripts to C:\windowsmic-bridge\, seeds
 # the user config, registers a scheduled task that runs at logon with the
 # correct resilience settings (no battery cutoff, restart-on-failure).
+# The task is launched via wscript.exe + a .vbs wrapper so the streaming
+# powershell never owns a visible console window.
 # Run from an elevated PowerShell at the repo root.
 
 $ErrorActionPreference = 'Stop'
 
 $dst = 'C:\windowsmic-bridge'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
-Copy-Item -Force "$PSScriptRoot\windowsmic.ps1" "$dst\windowsmic.ps1"
+Copy-Item -Force "$PSScriptRoot\windowsmic.ps1"          "$dst\windowsmic.ps1"
+Copy-Item -Force "$PSScriptRoot\windowsmic-launcher.vbs" "$dst\windowsmic-launcher.vbs"
 
 $cfgDir  = Join-Path $env:USERPROFILE '.windowsmic-bridge'
 $cfgFile = Join-Path $cfgDir 'config.ps1'
@@ -18,8 +21,8 @@ if (-not (Test-Path $cfgFile)) {
 }
 
 $action   = New-ScheduledTaskAction `
-    -Execute 'powershell' `
-    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File $dst\windowsmic.ps1"
+    -Execute 'wscript.exe' `
+    -Argument "`"$dst\windowsmic-launcher.vbs`""
 $trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -27,7 +30,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
-    -MultipleInstances IgnoreNew
+    -MultipleInstances IgnoreNew `
+    -Hidden
 
 Register-ScheduledTask `
     -TaskName 'WindowsMicStream' `

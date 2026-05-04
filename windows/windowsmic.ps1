@@ -9,6 +9,17 @@
 # Configuration: optional dot-source from
 #   $env:USERPROFILE\.windowsmic-bridge\config.ps1
 # (NOT in the repo) for $LinuxHost / $LinuxPort / $MicPattern overrides.
+#
+# All ffmpeg invocations go through [Diagnostics.Process] with
+# CreateNoWindow=$true so the streamer never owns a visible console, and
+# stderr is captured via the redirected pipe rather than PS5.1 `2>&1` (which
+# would wrap each stderr line as a NativeCommandError and abort the script
+# under $ErrorActionPreference = 'Stop').
+#
+# File MUST stay 7-bit ASCII. Without a UTF-8 BOM, PS5.1 reads non-ASCII
+# bytes through the OEM/ANSI code page and the parser blows up on smart
+# punctuation (em-dash, curly quotes). Use ASCII double-hyphen, not the
+# em-dash codepoint U+2014.
 
 $ErrorActionPreference = 'Stop'
 
@@ -24,9 +35,41 @@ if (-not $LinuxHost) {
     exit 1
 }
 
+function Quote-Arg {
+    param([string]$a)
+    if ($a -match '[\s"]') { return '"' + ($a -replace '"','\"') + '"' }
+    return $a
+}
+
+function Start-FFmpegHidden {
+    param([string[]]$FFmpegArgs, [switch]$CaptureStderr)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = 'ffmpeg'
+    $psi.Arguments              = ($FFmpegArgs | ForEach-Object { Quote-Arg $_ }) -join ' '
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    if ($CaptureStderr) {
+        $stderr = $p.StandardError.ReadToEnd()
+        [void]$p.StandardOutput.ReadToEnd()
+        $p.WaitForExit()
+        return $stderr
+    }
+    # Long-running invocation: drain both pipes asynchronously so the OS
+    # buffers never fill and block ffmpeg.
+    $null = $p.StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+    $null = $p.StandardError.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+    $p.WaitForExit()
+    return $p.ExitCode
+}
+
 function Resolve-MicName {
     param([string]$Pattern)
-    $listing     = & ffmpeg -hide_banner -list_devices true -f dshow -i dummy 2>&1 | Out-String
+    $listing     = Start-FFmpegHidden -CaptureStderr -FFmpegArgs @(
+        '-hide_banner','-list_devices','true','-f','dshow','-i','dummy'
+    )
     $regexString = '"([^"]*' + [regex]::Escape($Pattern) + '[^"]*)"\s*\(audio\)'
     $m           = [regex]::Match($listing, $regexString)
     if ($m.Success) { return $m.Groups[1].Value }
@@ -36,17 +79,19 @@ function Resolve-MicName {
 while ($true) {
     $MicName = Resolve-MicName -Pattern $MicPattern
     if (-not $MicName) {
-        Write-Host ("[{0}] no audio device matching '{1}' — retrying in 5s" -f (Get-Date -Format HH:mm:ss), $MicPattern)
+        Write-Host ("[{0}] no audio device matching '{1}' -- retrying in 5s" -f (Get-Date -Format HH:mm:ss), $MicPattern)
         Start-Sleep -Seconds 5
         continue
     }
 
     Write-Host ("[{0}] streaming '{1}' -> {2}:{3}" -f (Get-Date -Format HH:mm:ss), $MicName, $LinuxHost, $LinuxPort)
 
-    & ffmpeg -hide_banner -loglevel warning `
-        -f dshow -i "audio=$MicName" `
-        -acodec pcm_s16le -ar 48000 -ac 1 `
-        -f s16le "tcp://${LinuxHost}:${LinuxPort}"
+    [void](Start-FFmpegHidden -FFmpegArgs @(
+        '-hide_banner','-loglevel','warning',
+        '-f','dshow','-i',"audio=$MicName",
+        '-acodec','pcm_s16le','-ar','48000','-ac','1',
+        '-f','s16le',"tcp://${LinuxHost}:${LinuxPort}"
+    ))
 
     Write-Host ("[{0}] stream ended, re-resolving device in 1s..." -f (Get-Date -Format HH:mm:ss))
     Start-Sleep -Seconds 1
