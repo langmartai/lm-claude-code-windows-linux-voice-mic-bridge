@@ -23,19 +23,41 @@
 
 $ErrorActionPreference = 'Stop'
 
-# Self-hide our own console window. Windows 11 ConPTY ignores
-# `powershell.exe -WindowStyle Hidden` for scheduled tasks, so the host
-# console (class PseudoConsoleWindow) stays visible no matter what
-# install.ps1 / wscript wrapper sets. The Win32 call below hides our
-# own conhost window unconditionally and works without admin.
-Add-Type -Name __Hide -Namespace __WMB -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
-[System.Runtime.InteropServices.DllImport("user32.dll")]   public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
-'@ -ErrorAction SilentlyContinue
-try {
-    $__h = [__WMB.__Hide]::GetConsoleWindow()
-    if ($__h -ne [System.IntPtr]::Zero) { [void][__WMB.__Hide]::ShowWindow($__h, 0) }  # SW_HIDE = 0
-} catch { }
+# Self-detach.
+#
+# Windows 11 ConPTY ignores `powershell.exe -WindowStyle Hidden` for
+# scheduled tasks: the visible terminal isn't owned by our own
+# conhost (which we could hide with ShowWindow) but by a separate
+# WindowsTerminal.exe process we cannot reach. Re-registering the task to
+# launch via wscript.exe + .vbs would solve it, but that needs admin.
+#
+# Instead, on the first invocation we re-launch ourselves via
+# [Diagnostics.Process]::Start with CreateNoWindow=$true and exit. The
+# child gets no console window at all (no ConPTY hand-off, no Windows
+# Terminal tab) and runs the actual streaming loop. The original
+# task-spawned powershell exits 0 immediately, which closes its terminal
+# and does NOT trigger task-scheduler RestartOnFailure (that only fires on
+# non-zero exit codes).
+#
+# WINDOWSMIC_DETACHED short-circuits the relaunch on the child run so we
+# don't fork forever.
+if (-not $env:WINDOWSMIC_DETACHED) {
+    $selfPath = $MyInvocation.MyCommand.Path
+    if (-not $selfPath) { $selfPath = $PSCommandPath }
+    if ($selfPath) {
+        $psExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $psExe
+        $psi.Arguments              = "-NoProfile -ExecutionPolicy Bypass -File `"$selfPath`""
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+        $psi.WorkingDirectory       = [System.IO.Path]::GetDirectoryName($selfPath)
+        # Indexer assignment, not .Add(): tolerates the var already being set.
+        $psi.EnvironmentVariables['WINDOWSMIC_DETACHED'] = '1'
+        [void][System.Diagnostics.Process]::Start($psi)
+        exit 0
+    }
+}
 
 $LinuxHost  = ''                # set in config.ps1 (e.g. '192.0.2.10')
 $LinuxPort  = 9999
