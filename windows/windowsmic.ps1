@@ -23,6 +23,20 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Self-hide our own console window. Windows 11 ConPTY ignores
+# `powershell.exe -WindowStyle Hidden` for scheduled tasks, so the host
+# console (class PseudoConsoleWindow) stays visible no matter what
+# install.ps1 / wscript wrapper sets. The Win32 call below hides our
+# own conhost window unconditionally and works without admin.
+Add-Type -Name __Hide -Namespace __WMB -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")]   public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction SilentlyContinue
+try {
+    $__h = [__WMB.__Hide]::GetConsoleWindow()
+    if ($__h -ne [System.IntPtr]::Zero) { [void][__WMB.__Hide]::ShowWindow($__h, 0) }  # SW_HIDE = 0
+} catch { }
+
 $LinuxHost  = ''                # set in config.ps1 (e.g. '192.0.2.10')
 $LinuxPort  = 9999
 $MicPattern = 'Yamaha AG06'
