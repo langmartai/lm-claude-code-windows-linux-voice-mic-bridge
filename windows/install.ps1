@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
 $dst = 'C:\windowsmic-bridge'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 Copy-Item -Force "$PSScriptRoot\windowsmic.ps1"          "$dst\windowsmic.ps1"
+Copy-Item -Force "$PSScriptRoot\windowsmic-guardian.ps1" "$dst\windowsmic-guardian.ps1"
 Copy-Item -Force "$PSScriptRoot\windowsmic-launcher.vbs" "$dst\windowsmic-launcher.vbs"
 
 $cfgDir  = Join-Path $env:USERPROFILE '.windowsmic-bridge'
@@ -43,3 +44,21 @@ Register-ScheduledTask `
 
 Start-ScheduledTask -TaskName 'WindowsMicStream'
 Write-Host "==> WindowsMicStream task registered and started"
+
+# Guardian task: re-runs WindowsMicStream if the detached child PowerShell
+# crashes (Task Scheduler does not auto-restart it because the task's main
+# process exits 0 right after self-detaching). Uses the streamer's own
+# self-detach pattern so the guardian itself is also windowless.
+$guardianAction = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$dst\windowsmic-guardian.ps1`""
+Register-ScheduledTask `
+    -TaskName 'WindowsMicGuardian' `
+    -Action $guardianAction `
+    -Trigger $trigger `
+    -Settings $settings `
+    -RunLevel Limited `
+    -Force | Out-Null
+
+Start-ScheduledTask -TaskName 'WindowsMicGuardian'
+Write-Host "==> WindowsMicGuardian task registered and started"
