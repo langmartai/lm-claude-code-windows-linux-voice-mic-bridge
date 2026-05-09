@@ -14,23 +14,38 @@ this bridge points at the Windows mic.
 Read [README.md](README.md) for the user-facing story; this file is the
 maintainer's lens.
 
-## Architecture (v0.2)
+## Architecture (v0.3)
 
 Each side **observes only what it can cheaply observe**, **exposes truthful
 state on `/health`**, and **acts only on its own resources**. No SSH key
 crosses hosts.
 
-- Linux samples the WindowsMic source amplitude every 15s and exposes the
-  conclusion as `audio.zombie_likely` on `GET /health` (port 9998).
-- Windows polls Linux's `/health`. If Linux says zombie, Windows kills its
-  own ffmpeg; the streamer's `while($true)` loop respawns it.
+- Each Linux receiver samples its `WindowsMic` source amplitude every 15s
+  and exposes the conclusion as `audio.zombie_likely` on `GET /health`
+  (port 9998).
+- Windows ffmpeg captures dshow ONCE and uses the ffmpeg `tee` muxer to
+  fan out raw s16le to all configured `$LinuxTargets`. Per-output
+  `onfail=ignore` lets a dead/slow receiver be skipped without stalling
+  the others.
+- Windows monitor polls EVERY target's `/health`. If ANY reports
+  `zombie_likely=true`, it kills the local ffmpeg; the streamer's
+  `while($true)` loop respawns it. Rationale: one dshow handle feeds all
+  targets, so a zombie report from one target means the upstream capture
+  is broken and all targets are affected (others may just not have hit
+  `SILENT_LIMIT` yet).
 - Windows also exposes its own `/health` (port 9998) for human inspection
-  — process alive, TCP outbound, streamer task status. Linux does not poll
-  it (no action available), but it's there for `curl`-driven debugging.
+  — process alive, TCP outbound per-target, streamer task status. Linux
+  does not poll it (no action available), but it's there for `curl`-driven
+  debugging.
 
 The asymmetry of detection (only Linux can see the audio cheaply) and
 action (only Windows can fix its own ffmpeg) is intentional. The status
 endpoint is the thin contract that lets each side stay self-contained.
+
+**Adding a new Linux receiver** is two steps: install the Linux side on
+the new host (`bash linux/install.sh`), then add a new entry to
+`$LinuxTargets` in `%USERPROFILE%\.windowsmic-bridge\config.ps1` and
+bounce `WindowsMicStream` + `WindowsMicMonitor`. No code change.
 
 ## Working on this project
 

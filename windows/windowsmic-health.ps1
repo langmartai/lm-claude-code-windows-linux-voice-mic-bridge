@@ -31,13 +31,23 @@ if (-not $env:WINDOWSMIC_HEALTH_DETACHED) {
 
 # ---- main process (detached child) ----
 
+$LinuxTargets      = $null
 $LinuxHost         = ''
 $LinuxPort         = 9999
+$LinuxHealthPort   = 9998
 $WindowsHealthPort = 9998
-$Version           = '0.2.0'
+$Version           = '0.3.0'
 
 $cfg = Join-Path $env:USERPROFILE '.windowsmic-bridge\config.ps1'
 if (Test-Path $cfg) { . $cfg }
+
+if (-not $LinuxTargets -or $LinuxTargets.Count -eq 0) {
+    if ($LinuxHost) {
+        $LinuxTargets = @(@{ Host = $LinuxHost; Port = $LinuxPort; HealthPort = $LinuxHealthPort })
+    } else {
+        $LinuxTargets = @()
+    }
+}
 
 $LogPath = Join-Path $env:LOCALAPPDATA 'windowsmic-bridge\health.log'
 $LogDir  = [System.IO.Path]::GetDirectoryName($LogPath)
@@ -55,8 +65,10 @@ function Write-HLog {
 }
 
 function Get-FFmpegStatus {
+    # Match any ffmpeg process whose command line contains a tcp:// URL --
+    # tee mode embeds multiple targets in one cmdline, single mode has one.
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" -ErrorAction SilentlyContinue |
-               Where-Object { $_.CommandLine -and ($_.CommandLine -match ("tcp://[0-9.]+:" + [string]$LinuxPort)) })
+               Where-Object { $_.CommandLine -and ($_.CommandLine -match 'tcp://[0-9.]+:[0-9]+') })
     $info = @()
     foreach ($p in $procs) {
         $started = $null
@@ -74,17 +86,26 @@ function Get-FFmpegStatus {
 }
 
 function Get-TcpStatus {
-    try {
-        $conns = @(Get-NetTCPConnection -RemotePort $LinuxPort -State Established -ErrorAction SilentlyContinue)
-    } catch {
-        $conns = @()
+    # Aggregate established outbound connections to any configured target's stream port.
+    $allConns = @()
+    foreach ($t in $LinuxTargets) {
+        try {
+            $allConns += @(Get-NetTCPConnection -RemoteAddress $t.Host -RemotePort $t.Port -State Established -ErrorAction SilentlyContinue)
+        } catch { }
     }
-    $remotes = @()
-    foreach ($c in $conns) { $remotes += ("{0}:{1}" -f $c.RemoteAddress, $c.RemotePort) }
+    $perTarget = @()
+    foreach ($t in $LinuxTargets) {
+        try {
+            $c = @(Get-NetTCPConnection -RemoteAddress $t.Host -RemotePort $t.Port -State Established -ErrorAction SilentlyContinue)
+            $perTarget += @{ host = $t.Host; port = $t.Port; established = ($c.Count -gt 0); count = $c.Count }
+        } catch {
+            $perTarget += @{ host = $t.Host; port = $t.Port; established = $false; count = 0 }
+        }
+    }
     return @{
-        established = ($conns.Count -gt 0)
-        count       = $conns.Count
-        remotes     = $remotes
+        established = ($allConns.Count -gt 0)
+        count       = $allConns.Count
+        per_target  = $perTarget
     }
 }
 
@@ -114,9 +135,8 @@ function Get-Snapshot {
         tcp        = (Get-TcpStatus)
         task       = (Get-StreamerTaskStatus)
         config     = @{
-            linux_host  = $LinuxHost
-            linux_port  = $LinuxPort
-            health_port = $WindowsHealthPort
+            linux_targets = (@($LinuxTargets) | ForEach-Object { @{ host = $_.Host; port = $_.Port; health_port = $_.HealthPort } })
+            health_port   = $WindowsHealthPort
         }
     }
 }

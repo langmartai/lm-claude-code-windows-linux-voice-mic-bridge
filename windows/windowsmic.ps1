@@ -59,17 +59,40 @@ if (-not $env:WINDOWSMIC_DETACHED) {
     }
 }
 
-$LinuxHost  = ''                # set in config.ps1 (e.g. '192.0.2.10')
-$LinuxPort  = 9999
-$MicPattern = 'Yamaha AG06'
+# Multi-target: $LinuxTargets is the primary form
+#   $LinuxTargets = @(
+#       @{ Host = '192.0.2.10'; Port = 9999; HealthPort = 9998 },
+#       @{ Host = '192.0.2.11'; Port = 9999; HealthPort = 9998 }
+#   )
+# Legacy single-target ($LinuxHost / $LinuxPort) is still accepted and is
+# converted to a one-element $LinuxTargets list at runtime.
+$LinuxTargets    = $null
+$LinuxHost       = ''
+$LinuxPort       = 9999
+$LinuxHealthPort = 9998
+$MicPattern      = 'Yamaha AG06'
 
 $cfg = Join-Path $env:USERPROFILE '.windowsmic-bridge\config.ps1'
 if (Test-Path $cfg) { . $cfg }
 
-if (-not $LinuxHost) {
-    Write-Host "ERROR: \$LinuxHost not set. Create $cfg with: \$LinuxHost = '<linux-ip>'"
-    exit 1
+if (-not $LinuxTargets -or $LinuxTargets.Count -eq 0) {
+    if ($LinuxHost) {
+        $LinuxTargets = @(@{ Host = $LinuxHost; Port = $LinuxPort; HealthPort = $LinuxHealthPort })
+    } else {
+        Write-Host "ERROR: neither \$LinuxTargets nor \$LinuxHost set in $cfg"
+        exit 1
+    }
 }
+
+# Normalize: every target must have Host + Port; HealthPort defaults to 9998.
+$normalized = @()
+foreach ($t in $LinuxTargets) {
+    if (-not $t.Host) { Write-Host "ERROR: target missing Host: $($t | ConvertTo-Json -Compress)"; exit 1 }
+    if (-not $t.Port) { $t.Port = 9999 }
+    if (-not $t.HealthPort) { $t.HealthPort = 9998 }
+    $normalized += $t
+}
+$LinuxTargets = $normalized
 
 function Quote-Arg {
     param([string]$a)
@@ -112,6 +135,24 @@ function Resolve-MicName {
     return $null
 }
 
+function Build-OutputArgs {
+    param($Targets)
+    if ($Targets.Count -eq 1) {
+        $t = $Targets[0]
+        return @('-f', 's16le', ("tcp://{0}:{1}" -f $t.Host, $t.Port))
+    }
+    # Tee muxer with onfail=ignore per output: a single dead/slow receiver
+    # does not stall the others. URL parts contain ':' but that's fine because
+    # the tee parser splits on '|' between outputs and ']' between options/URL.
+    $parts = @()
+    foreach ($t in $Targets) {
+        $parts += ("[f=s16le:onfail=ignore]tcp://{0}:{1}" -f $t.Host, $t.Port)
+    }
+    return @('-map', '0:a', '-f', 'tee', ($parts -join '|'))
+}
+
+$targetsDesc = ($LinuxTargets | ForEach-Object { "{0}:{1}" -f $_.Host, $_.Port }) -join ', '
+
 while ($true) {
     $MicName = Resolve-MicName -Pattern $MicPattern
     if (-not $MicName) {
@@ -120,14 +161,15 @@ while ($true) {
         continue
     }
 
-    Write-Host ("[{0}] streaming '{1}' -> {2}:{3}" -f (Get-Date -Format HH:mm:ss), $MicName, $LinuxHost, $LinuxPort)
+    Write-Host ("[{0}] streaming '{1}' -> {2}" -f (Get-Date -Format HH:mm:ss), $MicName, $targetsDesc)
 
-    [void](Start-FFmpegHidden -FFmpegArgs @(
+    $ffArgs = @(
         '-hide_banner','-loglevel','warning',
         '-f','dshow','-i',"audio=$MicName",
-        '-acodec','pcm_s16le','-ar','48000','-ac','1',
-        '-f','s16le',"tcp://${LinuxHost}:${LinuxPort}"
-    ))
+        '-acodec','pcm_s16le','-ar','48000','-ac','1'
+    ) + (Build-OutputArgs -Targets $LinuxTargets)
+
+    [void](Start-FFmpegHidden -FFmpegArgs $ffArgs)
 
     Write-Host ("[{0}] stream ended, re-resolving device in 1s..." -f (Get-Date -Format HH:mm:ss))
     Start-Sleep -Seconds 1

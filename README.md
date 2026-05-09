@@ -46,28 +46,34 @@ existing SSH terminal and just makes the mic show up.
 ## Architecture
 
 ```
-Windows host                                    Linux host
+Windows host                                    Linux host(s) — N >= 1
 ─────────────                                   ───────────────────────────
 USB mic ──┐                                     ┌── PulseAudio
           │                                     │
        dshow                                    │   sink:   virtmic
           │                                     │            │ (monitor)
-       ffmpeg ──── raw s16le ────tcp:9999────►  ffmpeg ──────┤
-       (windowsmic.ps1)                                      │
-                                                   source: WindowsMic ◄── apps
-                                                            │
-                                                  health daemon (samples + exports)
-                                                            │
-                                                  GET /health  (tcp:9998)
-                                                            ▲
-                                                            │ poll every 15s
-                                                            │
-       windowsmic-monitor.ps1 ◄──── reads zombie_likely ────┘
-       (kills local ffmpeg if Linux reports zombie)
+       ffmpeg ──┬── raw s16le ──tcp:9999────►   ffmpeg ──────┤
+       (tee)   │                                              │
+               │                                  source: WindowsMic ◄── apps
+               │                                              │
+               │                                  health daemon
+               │                                              │
+               └── ... fan out to N targets    ◄──  GET /health (tcp:9998)
+                                                              ▲
+                                                              │ poll every 15s
+                                                              │
+       windowsmic-monitor.ps1 ◄────── reads zombie_likely ────┘
+       (kills local ffmpeg if any target reports zombie)
 
 Symmetric: windowsmic-health.ps1 also exposes GET /health on tcp:9998
 on the Windows side, mirroring the Linux endpoint for human inspection.
 ```
+
+**Multi-target (since v0.3):** Windows ffmpeg uses the `tee` muxer to fan
+out a single dshow capture to multiple Linux receivers (`onfail=ignore`
+per output, so a dead receiver doesn't stall the others). Each Linux
+receiver runs an independent listener + health daemon. Add a host = add
+an entry to `$LinuxTargets` and bounce the streamer task.
 
 Each side observes only what it can cheaply see, exposes truthful state
 on `/health`, and acts only on its own resources. No SSH key crosses
@@ -153,12 +159,15 @@ git clone git@github.com:langmartai/lm-claude-code-windows-linux-voice-mic-bridg
 cd lm-claude-code-windows-linux-voice-mic-bridge
 .\windows\install.ps1
 
-# Then set the Linux host IP
+# Then set the Linux target(s)
 notepad $env:USERPROFILE\.windowsmic-bridge\config.ps1
-schtasks /End  /TN WindowsMicStream
-schtasks /Run  /TN WindowsMicStream
-schtasks /End  /TN WindowsMicMonitor
-schtasks /Run  /TN WindowsMicMonitor
+#   $LinuxTargets = @(
+#       @{ Host = '192.0.2.10'; Port = 9999; HealthPort = 9998 },
+#       @{ Host = '192.0.2.11'; Port = 9999; HealthPort = 9998 }
+#   )
+
+schtasks /End /TN WindowsMicStream  ; schtasks /Run /TN WindowsMicStream
+schtasks /End /TN WindowsMicMonitor ; schtasks /Run /TN WindowsMicMonitor
 ```
 
 The installer registers four scheduled tasks (`WindowsMicStream`,
