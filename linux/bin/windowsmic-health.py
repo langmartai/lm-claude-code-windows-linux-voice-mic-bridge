@@ -27,12 +27,11 @@ import struct
 import subprocess
 import threading
 import time
-import wave
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # -------- config (env vars override config.env which overrides defaults) --------
 
@@ -79,11 +78,14 @@ HEALTH_PORT    = _cfg_int  ("HEALTH_PORT",    9998)
 HEALTH_BIND    = _cfg      ("HEALTH_BIND",    "0.0.0.0")
 CHECK_INTERVAL = _cfg_float("CHECK_INTERVAL", 15.0)
 SILENT_LIMIT   = _cfg_int  ("SILENT_LIMIT",   3)
-SAMPLE_SEC     = _cfg_float("SAMPLE_SEC",     3.0)
-SKIP_HEAD_SEC  = _cfg_float("SKIP_HEAD_SEC",  1.0)
 DEVICE         = _cfg      ("DEVICE",         "WindowsMic")
 LISTENER_UNIT  = _cfg      ("LISTENER_UNIT",  "windowsmic-listen.service")
 HISTORY_LEN    = _cfg_int  ("HISTORY_LEN",    20)
+
+# Continuous parec reader (v0.5): wire format and chunk sizing.
+_BYTES_PER_SEC = 48000 * 2 * 2  # 48k samples/s * 2 channels * 2 bytes/sample
+_CHUNK_SEC     = 0.25            # peak update granularity
+_CHUNK_BYTES   = max(4, (int(_BYTES_PER_SEC * _CHUNK_SEC) // 4) * 4)
 
 # Playback-flow config (Linux audio out -> Windows playback)
 EXPORT_PORT    = _cfg_int  ("EXPORT_PORT",    10000)
@@ -106,8 +108,7 @@ _state = {
         "health_port": HEALTH_PORT,
         "check_interval": CHECK_INTERVAL,
         "silent_limit": SILENT_LIMIT,
-        "sample_sec": SAMPLE_SEC,
-        "skip_head_sec": SKIP_HEAD_SEC,
+        "chunk_sec": _CHUNK_SEC,
         "device": DEVICE,
         "listener_unit": LISTENER_UNIT,
         "export_port": EXPORT_PORT,
@@ -126,6 +127,11 @@ _state = {
         "consecutive_silent": 0,
         "zombie_likely": False,
         "last_error": None,
+        # v0.5: continuous parec reader keeps WindowsMic permanently RUNNING
+        # so other consumers (Chrome WebRTC, etc) don't see the source flap.
+        "parec_running": False,
+        "parec_pid": None,
+        "parec_restarts": 0,
     },
     "playback": {
         "export_active": None,           # systemd unit windowsspeakers-export.service active
@@ -273,54 +279,6 @@ def _export_tcp_clients():
         return []
 
 
-def _record_and_peak():
-    """Record SAMPLE_SEC of DEVICE, return (peak_int|None, peak_db|None, error|None)."""
-    tmp = Path(f"/tmp/windowsmic-health.{os.getpid()}.wav")
-    p = None
-    try:
-        p = subprocess.Popen(
-            ["parecord", f"--device={DEVICE}", "--file-format=wav", str(tmp)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        time.sleep(SAMPLE_SEC + 0.3)
-        try:
-            p.terminate()
-            p.wait(timeout=2)
-        except Exception:
-            try:
-                p.kill()
-            except Exception:
-                pass
-        if not tmp.is_file() or tmp.stat().st_size < 64:
-            return (None, None, "recording empty")
-        with wave.open(str(tmp), "rb") as w:
-            sr = w.getframerate()
-            nframes = w.getnframes()
-            skip = int(SKIP_HEAD_SEC * sr)
-            if nframes <= skip:
-                return (None, None, "recording shorter than skip head")
-            w.setpos(skip)
-            frames = w.readframes(nframes - skip)
-        if not frames:
-            return (None, None, "no frames after skip")
-        n = len(frames) // 2
-        samples = struct.unpack("<" + "h" * n, frames)
-        peak = max((abs(s) for s in samples), default=0)
-        if peak <= 0:
-            return (0, None, None)
-        peak_db = 20.0 * math.log10(peak / 32768.0)
-        return (peak, peak_db, None)
-    except FileNotFoundError as e:
-        return (None, None, f"missing tool: {e}")
-    except Exception as e:
-        return (None, None, str(e))
-    finally:
-        try:
-            tmp.unlink()
-        except Exception:
-            pass
-
-
 def _sample_playback():
     """Cheap, non-recording observations for the playback flow."""
     export_active = _is_unit_active(EXPORT_UNIT)
@@ -337,75 +295,120 @@ def _sample_playback():
         p["last_check_at"] = datetime.now(timezone.utc).isoformat()
 
 
-def _sample_once():
-    # Playback observations are cheap and always run.
-    try:
-        _sample_playback()
-    except Exception as e:
-        with _lock:
-            _state["playback"]["last_check_at"] = datetime.now(timezone.utc).isoformat()
-            _state["playback"]["last_error"] = str(e)
+# -------- v0.5 continuous parec reader --------
+#
+# Why: the v0.4 design opened parecord every 15s for 3s, then closed it. Each
+# open/close cycled WindowsMic between SUSPENDED and RUNNING and forced a brief
+# pulse renegotiation. Other consumers (Chrome WebRTC in particular) react to
+# this by tearing down their stream -- "voice mode disconnected" symptom.
+#
+# v0.5 keeps a single long-lived `parec` running. Source stays RUNNING
+# permanently. We read 16-bit stereo PCM in fixed-size chunks, compute peak
+# per chunk in pure Python (struct.unpack is fast enough at our chunk size),
+# and aggregate into windows of CHECK_INTERVAL seconds for the same /health
+# JSON shape as before.
 
-    listener = _is_listener_active()
-    src_state = _windowsmic_source_state()
-    tcp = _is_tcp_established()
-
-    _update_stream({
-        "listener_active": listener,
-        "tcp_established": tcp,
-        "windowsmic_state": src_state,
-    })
-
-    if not listener or src_state is None:
-        with _lock:
-            a = _state["audio"]
-            a["last_sample_at"] = datetime.now(timezone.utc).isoformat()
-            a["last_peak"] = None
-            a["last_peak_db"] = None
-            a["last_error"] = "listener inactive" if not listener else "source missing"
-            a["zombie_likely"] = False
-            # do NOT mutate consecutive_silent here -- preserve last known streak
-        _push_history({
-            "at": _state["audio"]["last_sample_at"],
-            "peak": None, "peak_db": None,
-            "tcp_established": tcp,
-            "error": _state["audio"]["last_error"],
-        })
-        return
-
-    peak, peak_db, err = _record_and_peak()
+def _commit_window(window_peak, tcp_at_window_close):
+    """Called once per CHECK_INTERVAL window with the max chunk peak observed."""
+    if window_peak <= 0:
+        peak_db = None
+    else:
+        peak_db = 20.0 * math.log10(window_peak / 32768.0)
     now = datetime.now(timezone.utc).isoformat()
-
     with _lock:
         a = _state["audio"]
         a["last_sample_at"] = now
-        a["last_error"] = err
-        if err:
-            # Sample failed -- don't update streak (conservative).
-            a["last_peak"] = None
-            a["last_peak_db"] = None
-        elif peak == 0 and tcp:
+        a["last_peak"] = window_peak
+        a["last_peak_db"] = round(peak_db, 1) if peak_db is not None else None
+        a["last_error"] = None
+        if window_peak == 0 and tcp_at_window_close:
             a["consecutive_silent"] = a.get("consecutive_silent", 0) + 1
-            a["last_peak"] = 0
-            a["last_peak_db"] = None
-        elif peak == 0 and not tcp:
-            # Windows offline -> zeros expected. Don't accumulate.
+        elif window_peak == 0 and not tcp_at_window_close:
+            # Windows offline -> zeros expected, don't accumulate.
             a["consecutive_silent"] = 0
-            a["last_peak"] = 0
-            a["last_peak_db"] = None
         else:
             a["consecutive_silent"] = 0
-            a["last_peak"] = peak
-            a["last_peak_db"] = round(peak_db, 1) if peak_db is not None else None
-        a["zombie_likely"] = bool(tcp and a["consecutive_silent"] >= SILENT_LIMIT)
-
+        a["zombie_likely"] = bool(tcp_at_window_close and a["consecutive_silent"] >= SILENT_LIMIT)
     _push_history({
         "at": now,
-        "peak": peak,
+        "peak": window_peak,
         "peak_db": (round(peak_db, 1) if peak_db is not None else None),
-        "tcp_established": tcp,
-        "error": err,
+        "tcp_established": tcp_at_window_close,
+        "error": None,
     })
+
+
+def _parec_reader_loop():
+    """Long-lived parec stream. Restart with backoff on any failure."""
+    backoff = 1.0
+    while _running.is_set():
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [
+                    "parec",
+                    "--raw",
+                    f"--device={DEVICE}",
+                    "--rate=48000",
+                    "--channels=2",
+                    "--format=s16le",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            with _lock:
+                a = _state["audio"]
+                a["parec_running"] = True
+                a["parec_pid"] = proc.pid
+                a["last_error"] = None
+            backoff = 1.0  # reset backoff on successful spawn
+
+            window_start = time.monotonic()
+            window_peak = 0
+            while _running.is_set():
+                data = proc.stdout.read(_CHUNK_BYTES)
+                if not data:
+                    raise RuntimeError("parec stdout closed (process exited)")
+                if len(data) < 2:
+                    continue
+                # Compute peak amplitude over the chunk.
+                n = len(data) // 2
+                samples = struct.unpack("<" + "h" * n, data)
+                chunk_peak = max((abs(s) for s in samples), default=0)
+                if chunk_peak > window_peak:
+                    window_peak = chunk_peak
+
+                now_mono = time.monotonic()
+                if now_mono - window_start >= CHECK_INTERVAL:
+                    tcp_now = _is_tcp_established()
+                    _commit_window(window_peak, tcp_now)
+                    window_peak = 0
+                    window_start = now_mono
+        except Exception as e:
+            with _lock:
+                a = _state["audio"]
+                a["parec_running"] = False
+                a["parec_pid"] = None
+                a["parec_restarts"] = a.get("parec_restarts", 0) + 1
+                a["last_error"] = f"parec: {e}"
+        finally:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+        # Sleep with backoff before respawn (responsive to shutdown).
+        slept = 0.0
+        while _running.is_set() and slept < backoff:
+            time.sleep(0.1)
+            slept += 0.1
+        backoff = min(backoff * 2, 30.0)
 
 
 # -------- HTTP server --------
@@ -442,20 +445,6 @@ _running = threading.Event()
 _running.set()
 
 
-def _sampler_loop():
-    while _running.is_set():
-        try:
-            _sample_once()
-        except Exception as e:
-            with _lock:
-                _state["audio"]["last_error"] = f"sampler crashed: {e}"
-        # responsive shutdown
-        for _ in range(int(max(CHECK_INTERVAL * 10, 1))):
-            if not _running.is_set():
-                return
-            time.sleep(0.1)
-
-
 def _shutdown(signum, frame):
     _running.clear()
 
@@ -464,7 +453,10 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    threading.Thread(target=_sampler_loop, daemon=True).start()
+    # v0.5: continuous parec reader replaces the v0.4 periodic sampler.
+    # Cheap observations (TCP, sink state, listener active) are now done
+    # inline in _snapshot() on every /health request -- no separate poller.
+    threading.Thread(target=_parec_reader_loop, daemon=True).start()
 
     server = ThreadingHTTPServer((HEALTH_BIND, HEALTH_PORT), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
