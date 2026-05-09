@@ -1,0 +1,15 @@
+[Unit]
+Description=WindowsMic /health daemon (sampler + HTTP exporter)
+After=pulseaudio.service windowsmic-listen.service
+Wants=pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/windowsmic-health.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/windowsmic-health.log
+StandardError=append:/tmp/windowsmic-health.log
+
+[Install]
+WantedBy=default.target

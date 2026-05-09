@@ -33,9 +33,9 @@ Design choices flow from this use case:
 - **PulseAudio default source** — so `/voice` and other apps need no
   per-tool device configuration.
 - **Aggressive auto-recovery** — voice input has to "just work" when you
-  hit `/voice`. The watchdog handles the case where Windows dshow goes
-  zombie after a USB mic disconnect-reconnect, so you don't have to notice
-  or manually intervene.
+  hit `/voice`. The status-endpoint design (below) handles the case where
+  Windows dshow goes zombie after a USB mic disconnect-reconnect, so you
+  don't have to notice or manually intervene.
 
 ### Why not RDP audio redirection?
 
@@ -56,44 +56,64 @@ USB mic ──┐                                     ┌── PulseAudio
        (windowsmic.ps1)                                      │
                                                    source: WindowsMic ◄── apps
                                                             │
-                                                source-level watchdog ──► SSH-kill
-                                                                          Windows ffmpeg
-                                                                          on stuck stream
+                                                  health daemon (samples + exports)
+                                                            │
+                                                  GET /health  (tcp:9998)
+                                                            ▲
+                                                            │ poll every 15s
+                                                            │
+       windowsmic-monitor.ps1 ◄──── reads zombie_likely ────┘
+       (kills local ffmpeg if Linux reports zombie)
+
+Symmetric: windowsmic-health.ps1 also exposes GET /health on tcp:9998
+on the Windows side, mirroring the Linux endpoint for human inspection.
 ```
+
+Each side observes only what it can cheaply see, exposes truthful state
+on `/health`, and acts only on its own resources. No SSH key crosses
+hosts.
 
 ## Failure modes handled
 
 | Failure | Recovery layer | Time |
 |---|---|---|
 | Linux listener crashes | systemd `Restart=always` | 2s |
-| Linux watchdog crashes | systemd `Restart=always` | 5s |
+| Linux health daemon crashes | systemd `Restart=always` | 5s |
 | Windows ffmpeg crashes | PowerShell `while($true)` reconnect loop | 1s |
 | Windows scheduled task crashes | Task `RestartCount=999` / 1-min interval | 60s |
+| Windows streamer's detached child PS dies | `WindowsMicGuardian` task (60s tick) | 60-90s |
 | TCP drops | inner reconnect loops on both sides | 1–2s |
 | Windows enum index shifts (`(3-` → `(4-`) on USB replug | PS1 re-resolves device name by pattern every iteration | next loop |
-| **Sound card disconnect → Windows ffmpeg goes zombie (TCP up, all zeros)** | Linux watchdog detects digital silence (only when TCP is established), SSH-kills hung Windows ffmpeg, restarts listener | ~50s |
+| **Sound card disconnect → Windows ffmpeg goes zombie (TCP up, all zeros)** | Linux health daemon reports `zombie_likely=true`; Windows monitor polls and self-kills local ffmpeg; PS while-loop respawns | ~50s |
 | Sound card unplugged entirely | Windows ffmpeg dshow open fails → PS loop retries every 1s; resumes the moment the device returns | ~1s after device returns |
-| Windows simply offline | watchdog ignores (no TCP established) — no spurious bounces | n/a |
+| Windows simply offline | Linux reports `tcp_established=false` and never reports zombie; no spurious bounces | n/a |
 
 The most important non-obvious one is the sound-card-zombie case: dshow
 holds a stale handle and ffmpeg keeps writing zero buffers without ever
-hitting EOF or EPIPE, so the Windows-side reconnect loop alone is not
-enough. The SSH-kill from the Linux watchdog is what breaks the zombie.
+hitting EOF or EPIPE. **Detection** has to happen on the Linux side
+(consumer has cheap multiplexed access to the audio samples; Windows
+producer cannot tap its own dshow capture without contention). **Action**
+has to happen on the Windows side (the broken process lives there). The
+status endpoint is the thin contract between the two.
 
 ## Repo layout
 
 ```
 linux/
   bin/windowsmic-listen.sh        TCP listener -> PulseAudio sink
-  bin/windowsmic-watchdog.sh      Source-level silence watchdog + SSH-kill
+  bin/windowsmic-health.py        Sampler + GET /health on :9998 (replaces v0.1 watchdog)
   systemd/*.service               User-level systemd units (Restart=always)
   pulse/windowsmic.pa             null-sink + remap-source definition
   config.example.env              Template for ~/.config/windowsmic-bridge/config.env
-  install.sh                      Idempotent installer
+  install.sh                      Idempotent installer (also migrates v0.1 watchdog)
 windows/
   windowsmic.ps1                  ffmpeg dshow -> TCP, with pattern device match
+  windowsmic-guardian.ps1         Re-runs streamer task if its detached child PS dies
+  windowsmic-launcher.vbs         Hidden-window wrapper for the streamer task
+  windowsmic-health.ps1           HttpListener -> GET /health on :9998 (Windows-side observations)
+  windowsmic-monitor.ps1          Polls Linux /health, kills local ffmpeg on zombie report
   config.example.ps1              Template for %USERPROFILE%\.windowsmic-bridge\config.ps1
-  install.ps1                     Registers scheduled task with full resilience settings
+  install.ps1                     Registers all four scheduled tasks; sets urlacl + firewall
 ```
 
 Local configs (`config.env`, `config.ps1`) live OUTSIDE this repo in the
@@ -110,17 +130,21 @@ Requires: `pulseaudio` (or compatible), `ffmpeg`, `pactl`, `python3`,
 git clone git@github.com:langmartai/lm-claude-code-windows-linux-voice-mic-bridge.git
 cd lm-claude-code-windows-linux-voice-mic-bridge
 bash linux/install.sh
-
-# Then set Windows host + SSH key path (used for the watchdog SSH-kill)
-$EDITOR ~/.config/windowsmic-bridge/config.env
-systemctl --user restart windowsmic-watchdog.service
 ```
+
+That's it — no secrets to fill in. The default config (`PORT=9999`,
+`HEALTH_PORT=9998`, `HEALTH_BIND=0.0.0.0`) covers the common case. If you
+need to restrict the health endpoint to localhost or change ports, edit
+`~/.config/windowsmic-bridge/config.env` and `systemctl --user restart
+windowsmic-health.service`.
+
+If your Linux host has a host firewall or cloud security group, allow
+inbound TCP **9999** (audio stream) and **9998** (health endpoint) from
+the Windows host's address range.
 
 ### Windows side
 
-Requires: `ffmpeg` on PATH (`winget install Gyan.FFmpeg`), OpenSSH Server
-running with the public key from `WIN_KEY` in `authorized_keys` (so the
-Linux watchdog can SSH-kill).
+Requires: `ffmpeg` on PATH (`winget install Gyan.FFmpeg`).
 
 In an **elevated** PowerShell:
 
@@ -133,24 +157,56 @@ cd lm-claude-code-windows-linux-voice-mic-bridge
 notepad $env:USERPROFILE\.windowsmic-bridge\config.ps1
 schtasks /End  /TN WindowsMicStream
 schtasks /Run  /TN WindowsMicStream
+schtasks /End  /TN WindowsMicMonitor
+schtasks /Run  /TN WindowsMicMonitor
 ```
+
+The installer registers four scheduled tasks (`WindowsMicStream`,
+`WindowsMicGuardian`, `WindowsMicHealth`, `WindowsMicMonitor`), reserves
+the http urlacl `http://+:9998/` for the current user, and adds an
+inbound firewall rule on TCP 9998. SSH server, key generation, and
+`authorized_keys` editing are no longer needed — v0.2 doesn't touch SSH
+at all.
 
 ## Verify
 
 ```bash
 # Linux
-pactl list short sources | grep WindowsMic           # should exist
-ss -tn state established '( sport = :9999 )'         # should show ESTAB to Windows
-parecord --device=WindowsMic --file-format=wav /tmp/t.wav &
-sleep 4 && kill %1
-ffmpeg -i /tmp/t.wav -af volumedetect -f null - 2>&1 | grep volume
+curl -s http://127.0.0.1:9998/health | python3 -m json.tool
+pactl list short sources | grep WindowsMic
+ss -tn state established '( sport = :9999 )'
 ```
 
-If the test recording is silent (peak 0) and TCP is established, the
-watchdog should auto-bounce within ~50s. Watch it work:
+A healthy `/health` response looks like:
+
+```json
+{
+  "stream": {
+    "listener_active": true,
+    "tcp_established": true,
+    "windowsmic_state": "RUNNING"
+  },
+  "audio": {
+    "last_peak": 1234,
+    "last_peak_db": -28.4,
+    "consecutive_silent": 0,
+    "zombie_likely": false
+  }
+}
+```
+
+If `tcp_established=true`, `last_peak=0`, and `zombie_likely=true`, the
+Windows monitor will kill its local ffmpeg within ~15 s and the streamer
+will respawn it. Watch it happen:
 
 ```bash
-journalctl --user -u windowsmic-watchdog.service -f
+journalctl --user -u windowsmic-health.service -f
+```
+
+```powershell
+# Windows
+Invoke-RestMethod http://127.0.0.1:9998/health | ConvertTo-Json -Depth 6
+Get-Content "$env:LOCALAPPDATA\windowsmic-bridge\monitor.log" -Tail 20 -Wait
 ```
 
 ## Use as Claude Code voice input
@@ -166,10 +222,24 @@ Watchdog defaults are tuned for ~50s recovery. Override in
 
 ```bash
 CHECK_INTERVAL=15      # seconds between source-level samples
-SILENT_LIMIT=3         # consecutive zero-peak samples before bouncing
+SILENT_LIMIT=3         # consecutive zero-peak samples before zombie_likely=true
 SAMPLE_SEC=3.0         # length of each sampling recording
 SKIP_HEAD_SEC=1.0      # parecord startup latency to skip
 ```
+
+## Migrating from v0.1 (SSH-kill watchdog)
+
+`linux/install.sh` automatically disables and removes
+`windowsmic-watchdog.service` and `~/bin/windowsmic-watchdog.sh` if it
+finds them, then installs the new health daemon. After running it:
+
+- `WIN_HOST` and `WIN_KEY` in `~/.config/windowsmic-bridge/config.env`
+  are unused — you can leave them or delete the lines. No SSH key is
+  needed any more (Windows monitor pulls Linux state via HTTP).
+- On Windows, re-run the elevated `install.ps1` to register the new
+  `WindowsMicHealth` and `WindowsMicMonitor` tasks. The existing
+  `WindowsMicStream` and `WindowsMicGuardian` tasks are recreated
+  unchanged.
 
 ## Gotchas worth knowing
 
@@ -182,7 +252,12 @@ SKIP_HEAD_SEC=1.0      # parecord startup latency to skip
 - A 2-second test recording often looks "silent" even on a healthy stream
   — `parecord` startup latency eats most of that window. Use ≥3 seconds.
 - Long-running dshow captures occasionally go silent without erroring. The
-  watchdog handles this; do not try to detect it via process state alone.
+  status-endpoint flow handles this; do not try to detect it via process
+  state alone.
+- Don't run a manual `parecord --device=WindowsMic` while the health daemon
+  is sampling — overlapping clients on the same source break each other.
+  `systemctl --user stop windowsmic-health.service` first when probing
+  ad-hoc.
 
 ## License
 
