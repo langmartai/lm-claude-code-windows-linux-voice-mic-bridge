@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 
 # -------- config (env vars override config.env which overrides defaults) --------
 
@@ -85,6 +85,11 @@ DEVICE         = _cfg      ("DEVICE",         "WindowsMic")
 LISTENER_UNIT  = _cfg      ("LISTENER_UNIT",  "windowsmic-listen.service")
 HISTORY_LEN    = _cfg_int  ("HISTORY_LEN",    20)
 
+# Playback-flow config (Linux audio out -> Windows playback)
+EXPORT_PORT    = _cfg_int  ("EXPORT_PORT",    10000)
+SPEAKERS_SINK  = _cfg      ("SPEAKERS_SINK",  "WindowsSpeakers")
+EXPORT_UNIT    = _cfg      ("EXPORT_UNIT",    "windowsspeakers-export.service")
+
 # Pulse sometimes can't find the user socket inside systemd --user services
 # without an explicit PULSE_SERVER. The user sockets path is the systemd default.
 os.environ.setdefault("PULSE_SERVER", f"unix:/run/user/{os.getuid()}/pulse/native")
@@ -105,6 +110,9 @@ _state = {
         "skip_head_sec": SKIP_HEAD_SEC,
         "device": DEVICE,
         "listener_unit": LISTENER_UNIT,
+        "export_port": EXPORT_PORT,
+        "speakers_sink": SPEAKERS_SINK,
+        "export_unit": EXPORT_UNIT,
     },
     "stream": {
         "listener_active": None,
@@ -118,6 +126,14 @@ _state = {
         "consecutive_silent": 0,
         "zombie_likely": False,
         "last_error": None,
+    },
+    "playback": {
+        "export_active": None,           # systemd unit windowsspeakers-export.service active
+        "tcp_listening": None,           # ffmpeg bound on EXPORT_PORT in LISTEN state
+        "tcp_clients": [],               # list of remote "host:port" strings currently connected
+        "tcp_client_count": 0,
+        "speakers_sink_state": None,    # WindowsSpeakers sink state (RUNNING/IDLE/SUSPENDED)
+        "last_check_at": None,
     },
     "history": [],
 }
@@ -136,6 +152,24 @@ def _push_history(entry):
 
 
 def _snapshot():
+    """Fresh observations on every request -- only the expensive audio sampling
+    is cached (it runs in the sampler thread on CHECK_INTERVAL). The cheap
+    queries (systemctl is-active, ss, pactl) re-run inline so the dashboard
+    sees the current sink/TCP state, not a 15-second-old snapshot."""
+    try:
+        _sample_playback()
+    except Exception:
+        pass
+    try:
+        listener = _is_listener_active()
+        src_state = _windowsmic_source_state()
+        tcp = _is_tcp_established()
+        with _lock:
+            _state["stream"]["listener_active"] = listener
+            _state["stream"]["tcp_established"] = tcp
+            _state["stream"]["windowsmic_state"] = src_state
+    except Exception:
+        pass
     with _lock:
         return json.loads(json.dumps(_state, default=str))
 
@@ -179,6 +213,64 @@ def _windowsmic_source_state():
         return None
     except Exception:
         return None
+
+
+def _speakers_sink_state():
+    try:
+        out = subprocess.check_output(
+            ["pactl", "list", "short", "sinks"], timeout=3, text=True,
+        )
+        for line in out.splitlines():
+            cols = line.split("\t")
+            if len(cols) >= 4 and cols[1] == SPEAKERS_SINK:
+                return cols[-1].strip()
+        return None
+    except Exception:
+        return None
+
+
+def _is_unit_active(unit):
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", unit],
+            timeout=3,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _export_listening():
+    """Is some local process LISTENing on EXPORT_PORT?"""
+    try:
+        out = subprocess.check_output(
+            ["ss", "-tln", f"( sport = :{EXPORT_PORT} )"],
+            timeout=3, text=True,
+        )
+        for line in out.splitlines()[1:]:
+            if line.strip():
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _export_tcp_clients():
+    """Return list of established peers connected to local EXPORT_PORT."""
+    try:
+        out = subprocess.check_output(
+            ["ss", "-tn", "state", "established", f"( sport = :{EXPORT_PORT} )"],
+            timeout=3, text=True,
+        )
+        peers = []
+        for line in out.splitlines()[1:]:
+            cols = line.split()
+            # Columns: Recv-Q Send-Q Local Peer ...
+            if len(cols) >= 4:
+                peers.append(cols[3])
+        return peers
+    except Exception:
+        return []
 
 
 def _record_and_peak():
@@ -229,7 +321,31 @@ def _record_and_peak():
             pass
 
 
+def _sample_playback():
+    """Cheap, non-recording observations for the playback flow."""
+    export_active = _is_unit_active(EXPORT_UNIT)
+    tcp_listen = _export_listening()
+    clients = _export_tcp_clients()
+    sink_state = _speakers_sink_state()
+    with _lock:
+        p = _state["playback"]
+        p["export_active"] = export_active
+        p["tcp_listening"] = tcp_listen
+        p["tcp_clients"] = clients
+        p["tcp_client_count"] = len(clients)
+        p["speakers_sink_state"] = sink_state
+        p["last_check_at"] = datetime.now(timezone.utc).isoformat()
+
+
 def _sample_once():
+    # Playback observations are cheap and always run.
+    try:
+        _sample_playback()
+    except Exception as e:
+        with _lock:
+            _state["playback"]["last_check_at"] = datetime.now(timezone.utc).isoformat()
+            _state["playback"]["last_error"] = str(e)
+
     listener = _is_listener_active()
     src_state = _windowsmic_source_state()
     tcp = _is_tcp_established()

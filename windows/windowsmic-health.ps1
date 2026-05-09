@@ -36,7 +36,7 @@ $LinuxHost         = ''
 $LinuxPort         = 9999
 $LinuxHealthPort   = 9998
 $WindowsHealthPort = 9998
-$Version           = '0.3.0'
+$Version           = '0.4.0'
 
 $cfg = Join-Path $env:USERPROFILE '.windowsmic-bridge\config.ps1'
 if (Test-Path $cfg) { . $cfg }
@@ -47,6 +47,10 @@ if (-not $LinuxTargets -or $LinuxTargets.Count -eq 0) {
     } else {
         $LinuxTargets = @()
     }
+}
+$DefaultPlaybackPort = 10000
+foreach ($t in $LinuxTargets) {
+    if (-not $t.PlaybackPort) { $t.PlaybackPort = $DefaultPlaybackPort }
 }
 
 $LogPath = Join-Path $env:LOCALAPPDATA 'windowsmic-bridge\health.log'
@@ -109,6 +113,43 @@ function Get-TcpStatus {
     }
 }
 
+function Get-PlaybackStatus {
+    # One ffplay child per target -- match by command-line containing
+    # tcp://host:playback_port. Return per-target alive flag + PID, plus
+    # outbound TCP state to each target's PlaybackPort.
+    $allFFplay = @(Get-CimInstance Win32_Process -Filter "Name='ffplay.exe'" -ErrorAction SilentlyContinue)
+    $perTarget = @()
+    foreach ($t in $LinuxTargets) {
+        $pattern  = ("tcp://{0}:{1}" -f [regex]::Escape($t.Host), $t.PlaybackPort)
+        $proc     = $allFFplay | Where-Object { $_.CommandLine -and ($_.CommandLine -match $pattern) } | Select-Object -First 1
+        $alive    = $false
+        $childPid = $null
+        $started  = $null
+        if ($proc) {
+            $alive = $true
+            $childPid = $proc.ProcessId
+            try { $started = (Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().ToString("o") } catch { }
+        }
+        $tcpEst = $false
+        try {
+            $c = @(Get-NetTCPConnection -RemoteAddress $t.Host -RemotePort $t.PlaybackPort -State Established -ErrorAction SilentlyContinue)
+            $tcpEst = ($c.Count -gt 0)
+        } catch { }
+        $perTarget += @{
+            host          = $t.Host
+            playback_port = $t.PlaybackPort
+            ffplay_alive  = $alive
+            ffplay_pid    = $childPid
+            started_at    = $started
+            tcp_established = $tcpEst
+        }
+    }
+    return @{
+        per_target          = $perTarget
+        total_ffplay_count  = $allFFplay.Count
+    }
+}
+
 function Get-StreamerTaskStatus {
     try {
         $rows = & schtasks.exe /Query /TN 'WindowsMicStream' /FO CSV /V 2>$null | ConvertFrom-Csv
@@ -125,6 +166,17 @@ function Get-StreamerTaskStatus {
     return @{ status = $null }
 }
 
+function Get-ReceiverTaskStatus {
+    try {
+        $rows = & schtasks.exe /Query /TN 'WindowsSpeakersReceive' /FO CSV /V 2>$null | ConvertFrom-Csv
+        if ($rows -and $rows.Count -gt 0) {
+            $r = $rows[0]
+            return @{ status = $r.Status; last_run = $r.'Last Run Time'; last_result = $r.'Last Result' }
+        }
+    } catch { }
+    return @{ status = $null }
+}
+
 function Get-Snapshot {
     return @{
         version    = $Version
@@ -134,8 +186,10 @@ function Get-Snapshot {
         ffmpeg     = (Get-FFmpegStatus)
         tcp        = (Get-TcpStatus)
         task       = (Get-StreamerTaskStatus)
+        playback   = (Get-PlaybackStatus)
+        receiver_task = (Get-ReceiverTaskStatus)
         config     = @{
-            linux_targets = (@($LinuxTargets) | ForEach-Object { @{ host = $_.Host; port = $_.Port; health_port = $_.HealthPort } })
+            linux_targets = (@($LinuxTargets) | ForEach-Object { @{ host = $_.Host; port = $_.Port; health_port = $_.HealthPort; playback_port = $_.PlaybackPort } })
             health_port   = $WindowsHealthPort
         }
     }

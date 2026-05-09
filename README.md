@@ -1,8 +1,15 @@
 # lm-claude-code-windows-linux-voice-mic-bridge
 
-Stream a Windows microphone over raw TCP to a Linux machine, where it appears
-as a regular PulseAudio input device (`WindowsMic`) any app — Claude Code
-voice input, browsers, STT tools — can record from.
+Bidirectional audio bridge between a Windows host and one or more Linux
+hosts over raw TCP, with no SSH tunnel and no audio session in the middle.
+
+- **Mic**: Windows microphone → all Linux hosts. Each Linux exposes the
+  stream as a regular PulseAudio input device (`WindowsMic`, the default
+  source) — Claude Code voice input, browsers, STT tools record from it.
+- **Speakers**: each Linux's audio output → Windows speakers. Linux
+  apps play to the `WindowsSpeakers` PulseAudio sink (default sink); a
+  Windows ffplay client per host plays the stream to the default Windows
+  playback device. The Windows audio engine mixes N hosts natively.
 
 ## Primary use case: Claude Code `/voice` from a remote Linux box
 
@@ -45,6 +52,8 @@ existing SSH terminal and just makes the mic show up.
 
 ## Architecture
 
+### Mic flow (Windows → Linux, fan-out to N hosts)
+
 ```
 Windows host                                    Linux host(s) — N >= 1
 ─────────────                                   ───────────────────────────
@@ -53,21 +62,44 @@ USB mic ──┐                                     ┌── PulseAudio
        dshow                                    │   sink:   virtmic
           │                                     │            │ (monitor)
        ffmpeg ──┬── raw s16le ──tcp:9999────►   ffmpeg ──────┤
-       (tee)   │                                              │
-               │                                  source: WindowsMic ◄── apps
-               │                                              │
-               │                                  health daemon
-               │                                              │
-               └── ... fan out to N targets    ◄──  GET /health (tcp:9998)
-                                                              ▲
-                                                              │ poll every 15s
-                                                              │
-       windowsmic-monitor.ps1 ◄────── reads zombie_likely ────┘
+       (tee)    │                                             │
+                │                                 source: WindowsMic ◄── apps
+                │                                             │
+                │                                 health daemon
+                │                                             │
+                └── ... fan out to N targets   ◄── GET /health (tcp:9998)
+                                                             ▲
+                                                             │ poll every 15s
+                                                             │
+       windowsmic-monitor.ps1 ◄───── reads zombie_likely ────┘
        (kills local ffmpeg if any target reports zombie)
-
-Symmetric: windowsmic-health.ps1 also exposes GET /health on tcp:9998
-on the Windows side, mirroring the Linux endpoint for human inspection.
 ```
+
+Symmetric: `windowsmic-health.ps1` also exposes `GET /health` on tcp:9998
+on the Windows side, mirroring the Linux endpoint for human inspection.
+
+### Speakers flow (Linux → Windows, mixed at Windows default sink)
+
+```
+Windows host                                    Linux host(s) — N >= 1
+─────────────                                   ───────────────────────────
+Default speakers                                Linux apps
+  ▲                                                  │
+  │                                                  ▼
+  ffplay (SDL2) ───┐                          PulseAudio
+  ffplay (SDL2) ───┼── raw s16le ◄──tcp:10000───  ffmpeg
+  ...              │                              (listen=1)
+  one per target  │                                  ▲
+                   │                                  │ monitor
+                   ▼                                  │
+        Windows audio engine               sink: WindowsSpeakers ◄── apps
+        (native mix of N streams)
+```
+
+Each Linux exposes its `WindowsSpeakers.monitor` as a TCP server. Windows
+runs one ffplay per target — each dials in, receives raw s16le, plays via
+SDL2 to the default playback device. The Windows audio engine mixes the
+streams natively. No filter graph, no `amix`, just native multi-stream.
 
 **Multi-target (since v0.3):** Windows ffmpeg uses the `tee` muxer to fan
 out a single dshow capture to multiple Linux receivers (`onfail=ignore`
@@ -106,20 +138,23 @@ status endpoint is the thin contract between the two.
 
 ```
 linux/
-  bin/windowsmic-listen.sh        TCP listener -> PulseAudio sink
-  bin/windowsmic-health.py        Sampler + GET /health on :9998 (replaces v0.1 watchdog)
-  systemd/*.service               User-level systemd units (Restart=always)
-  pulse/windowsmic.pa             null-sink + remap-source definition
-  config.example.env              Template for ~/.config/windowsmic-bridge/config.env
-  install.sh                      Idempotent installer (also migrates v0.1 watchdog)
+  bin/windowsmic-listen.sh             TCP listener -> PulseAudio sink (mic in)
+  bin/windowsmic-health.py             Sampler + GET /health on :9998
+  bin/windowsspeakers-export.sh        Pulse monitor -> TCP listen on :10000 (audio out)
+  systemd/*.service                    User-level systemd units (Restart=always)
+  pulse/windowsmic.pa                  null-sink + remap-source for WindowsMic (input)
+  pulse/windowsspeakers.pa             null-sink for WindowsSpeakers (output, default sink)
+  config.example.env                   Template for ~/.config/windowsmic-bridge/config.env
+  install.sh                           Idempotent installer (migrates v0.1 watchdog)
 windows/
-  windowsmic.ps1                  ffmpeg dshow -> TCP, with pattern device match
-  windowsmic-guardian.ps1         Re-runs streamer task if its detached child PS dies
-  windowsmic-launcher.vbs         Hidden-window wrapper for the streamer task
-  windowsmic-health.ps1           HttpListener -> GET /health on :9998 (Windows-side observations)
-  windowsmic-monitor.ps1          Polls Linux /health, kills local ffmpeg on zombie report
-  config.example.ps1              Template for %USERPROFILE%\.windowsmic-bridge\config.ps1
-  install.ps1                     Registers all four scheduled tasks; sets urlacl + firewall
+  windowsmic.ps1                       ffmpeg dshow -> TCP tee to N targets
+  windowsmic-guardian.ps1              Re-runs streamer task if its detached child PS dies
+  windowsmic-launcher.vbs              Hidden-window wrapper for the streamer task
+  windowsmic-health.ps1                HttpListener -> GET /health on :9998
+  windowsmic-monitor.ps1               Polls all targets' /health, kills local ffmpeg on zombie
+  windowsspeakers-receive.ps1          Maintains one ffplay per target -> default Windows playback
+  config.example.ps1                   Template for %USERPROFILE%\.windowsmic-bridge\config.ps1
+  install.ps1                          Registers all five scheduled tasks; sets urlacl + firewall
 ```
 
 Local configs (`config.env`, `config.ps1`) live OUTSIDE this repo in the
@@ -145,8 +180,8 @@ need to restrict the health endpoint to localhost or change ports, edit
 windowsmic-health.service`.
 
 If your Linux host has a host firewall or cloud security group, allow
-inbound TCP **9999** (audio stream) and **9998** (health endpoint) from
-the Windows host's address range.
+inbound TCP **9999** (mic stream), **9998** (health endpoint), and
+**10000** (playback exporter) from the Windows host's address range.
 
 ### Windows side
 
@@ -223,6 +258,30 @@ Get-Content "$env:LOCALAPPDATA\windowsmic-bridge\monitor.log" -Tail 20 -Wait
 The pulse config sets `WindowsMic` as the default source, so any STT tool
 respecting the PulseAudio default picks it automatically. If your tool
 takes an explicit device, point it at `WindowsMic`.
+
+## Audio output from Linux
+
+The pulse config also sets `WindowsSpeakers` as the default sink. Apps
+that play audio (browsers, mpv, espeak, etc.) write there by default;
+the `windowsspeakers-export` service streams the sink's monitor to
+Windows, where one `ffplay` per host plays it through the default
+Windows playback device. Verify with:
+
+```bash
+# Linux side: should be the default sink
+pactl get-default-sink             # WindowsSpeakers
+pactl list short sinks   | grep WindowsSpeakers
+ss -tln '( sport = :10000 )'       # exporter listening
+```
+
+```powershell
+# Windows side: should be one ffplay per target
+Get-Process ffplay -ErrorAction SilentlyContinue
+Get-Content "$env:LOCALAPPDATA\windowsmic-bridge\speakers-receive.log" -Tail 20
+```
+
+Quick end-to-end test from a Linux host: `paplay /usr/share/sounds/alsa/Front_Center.wav`
+should play through the Windows speakers within a second or two of latency.
 
 ## Tuning
 

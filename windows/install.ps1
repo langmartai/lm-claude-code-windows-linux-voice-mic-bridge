@@ -13,11 +13,12 @@ $ErrorActionPreference = 'Stop'
 
 $dst = 'C:\windowsmic-bridge'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
-Copy-Item -Force "$PSScriptRoot\windowsmic.ps1"          "$dst\windowsmic.ps1"
-Copy-Item -Force "$PSScriptRoot\windowsmic-guardian.ps1" "$dst\windowsmic-guardian.ps1"
-Copy-Item -Force "$PSScriptRoot\windowsmic-launcher.vbs" "$dst\windowsmic-launcher.vbs"
-Copy-Item -Force "$PSScriptRoot\windowsmic-health.ps1"   "$dst\windowsmic-health.ps1"
-Copy-Item -Force "$PSScriptRoot\windowsmic-monitor.ps1"  "$dst\windowsmic-monitor.ps1"
+Copy-Item -Force "$PSScriptRoot\windowsmic.ps1"               "$dst\windowsmic.ps1"
+Copy-Item -Force "$PSScriptRoot\windowsmic-guardian.ps1"      "$dst\windowsmic-guardian.ps1"
+Copy-Item -Force "$PSScriptRoot\windowsmic-launcher.vbs"      "$dst\windowsmic-launcher.vbs"
+Copy-Item -Force "$PSScriptRoot\windowsmic-health.ps1"        "$dst\windowsmic-health.ps1"
+Copy-Item -Force "$PSScriptRoot\windowsmic-monitor.ps1"       "$dst\windowsmic-monitor.ps1"
+Copy-Item -Force "$PSScriptRoot\windowsspeakers-receive.ps1"  "$dst\windowsspeakers-receive.ps1"
 
 $cfgDir  = Join-Path $env:USERPROFILE '.windowsmic-bridge'
 $cfgFile = Join-Path $cfgDir 'config.ps1'
@@ -112,8 +113,24 @@ Register-ScheduledTask `
 Start-ScheduledTask -TaskName 'WindowsMicMonitor'
 Write-Host "==> WindowsMicMonitor task registered and started"
 
+# ---- speakers receive (Linux audio out -> Windows playback via ffplay) ----
+$speakersAction = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$dst\windowsspeakers-receive.ps1`""
+Register-ScheduledTask `
+    -TaskName 'WindowsSpeakersReceive' `
+    -Action $speakersAction `
+    -Trigger $trigger `
+    -Settings $settings `
+    -RunLevel Limited `
+    -Force | Out-Null
+Start-ScheduledTask -TaskName 'WindowsSpeakersReceive'
+Write-Host "==> WindowsSpeakersReceive task registered and started"
+
 Write-Host ""
 Write-Host "==> Verify with:"
 Write-Host ("    Invoke-RestMethod http://127.0.0.1:{0}/health | ConvertTo-Json -Depth 6" -f $WindowsHealthPort)
-Write-Host "    schtasks /Query /TN WindowsMicStream  /V /FO LIST | Select-String 'Status|Last'"
-Write-Host "    schtasks /Query /TN WindowsMicMonitor /V /FO LIST | Select-String 'Status|Last'"
+Write-Host "    schtasks /Query /TN WindowsMicStream         /V /FO LIST | Select-String 'Status|Last'"
+Write-Host "    schtasks /Query /TN WindowsMicMonitor        /V /FO LIST | Select-String 'Status|Last'"
+Write-Host "    schtasks /Query /TN WindowsSpeakersReceive   /V /FO LIST | Select-String 'Status|Last'"
+Write-Host "    Get-Content `$env:LOCALAPPDATA\windowsmic-bridge\speakers-receive.log -Tail 20"

@@ -14,7 +14,21 @@ this bridge points at the Windows mic.
 Read [README.md](README.md) for the user-facing story; this file is the
 maintainer's lens.
 
-## Architecture (v0.3)
+## Architecture (v0.4)
+
+The bridge is **bidirectional**:
+- **Mic flow**: Windows mic → all configured Linux hosts. One Windows
+  ffmpeg tees to N Linux receivers. Each Linux exposes `WindowsMic`
+  (PulseAudio default source).
+- **Speakers flow**: each Linux's audio output → Windows playback. Each
+  Linux exposes `WindowsSpeakers.monitor` over a TCP listen socket; one
+  Windows ffplay per host pulls and plays via SDL2 to the default Windows
+  playback device. The Windows audio engine mixes natively.
+
+Naming convention: anything starting with `windowsmic-*` is the Windows-mic
+flow; anything `windowsspeakers-*` is the Linux-speakers flow.
+
+## Mic flow (v0.3)
 
 Each side **observes only what it can cheaply observe**, **exposes truthful
 state on `/health`**, and **acts only on its own resources**. No SSH key
@@ -45,7 +59,48 @@ endpoint is the thin contract that lets each side stay self-contained.
 **Adding a new Linux receiver** is two steps: install the Linux side on
 the new host (`bash linux/install.sh`), then add a new entry to
 `$LinuxTargets` in `%USERPROFILE%\.windowsmic-bridge\config.ps1` and
-bounce `WindowsMicStream` + `WindowsMicMonitor`. No code change.
+bounce `WindowsMicStream` + `WindowsMicMonitor` + `WindowsSpeakersReceive`.
+No code change.
+
+## Speakers flow (v0.4)
+
+The reverse direction. Linux apps play to the `WindowsSpeakers` PulseAudio
+sink (made default by the dropped-in `windowsspeakers.pa`). The
+`windowsspeakers-export` systemd service runs `ffmpeg -f pulse -i
+WindowsSpeakers.monitor ... -f s16le tcp://0.0.0.0:10000?listen=1`,
+accepting one Windows client at a time. On client disconnect ffmpeg
+exits with EOF; the outer `while true` relistens.
+
+On Windows, `windowsspeakers-receive.ps1` runs as a scheduled task.
+It maintains one `ffplay` child per `$LinuxTargets` entry. Each child:
+
+```
+ffplay -nodisp -autoexit -fflags nobuffer \
+       -f s16le -ar 48000 -ac 2 \
+       tcp://<linux-host>:<PlaybackPort>
+```
+
+ffplay uses SDL2, which dispatches to the Windows default playback
+endpoint (the same one Windows Sound Settings shows as default). If a
+child exits, the script respawns it on the next tick (poll interval 2s).
+
+**Why ffplay, not ffmpeg:** upstream `ffmpeg` builds on Windows do not
+have a clean native audio OUTPUT muxer (`-f dshow` is input only,
+`-f wasapi` is loopback-input only). The Gyan.FFmpeg distribution
+bundles `ffplay` (built on SDL2), which IS a real Windows audio player.
+We use it for the playback consumer; the streamer is still `ffmpeg.exe`.
+
+**Why one ffplay per host instead of one ffmpeg with `amix`:**
+- Independent reconnect / failure isolation per target.
+- No filter graph, no codec stack — fewer moving parts.
+- Windows audio engine already mixes concurrent streams natively, so we
+  don't need to do it ourselves.
+
+**Default sink concern:** `set-default-sink WindowsSpeakers` in the
+pulse config means every new app on Linux plays here. On a host with
+real audio hardware, this overrides the local speakers — comment out
+`set-default-sink` in `/etc/pulse/default.pa.d/windowsspeakers.pa` and
+reload pulse if you want a different default.
 
 ## Working on this project
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=WindowsSpeakers PulseAudio->TCP exporter (Linux audio out -> Windows playback)
+After=pulseaudio.service
+Requires=pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/windowsspeakers-export.sh
+Restart=always
+RestartSec=2
+StandardOutput=append:/tmp/windowsspeakers-export.log
+StandardError=append:/tmp/windowsspeakers-export.log
+
+[Install]
+WantedBy=default.target

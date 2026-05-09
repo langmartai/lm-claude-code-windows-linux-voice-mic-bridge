@@ -1,0 +1,14 @@
+### Virtual playback sink for the Linux->Windows audio bridge.
+### Drop in /etc/pulse/default.pa.d/
+###
+### Creates a null-sink that Linux apps can play to. The sink's monitor
+### source is what windowsspeakers-export.sh streams to Windows over TCP.
+### Setting WindowsSpeakers as default-sink means apps go here without any
+### per-app configuration -- mirrors WindowsMic being default-source for the
+### opposite direction.
+###
+### Format must match the wire (48kHz s16le stereo) so the monitor doesn't
+### resample silently.
+
+load-module module-null-sink sink_name=WindowsSpeakers rate=48000 channels=2 sink_properties=device.description=Virtual_Speakers_To_Windows
+set-default-sink WindowsSpeakers

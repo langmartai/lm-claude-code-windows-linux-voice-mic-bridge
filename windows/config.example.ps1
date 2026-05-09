@@ -3,11 +3,17 @@
 # this file if it exists. Do NOT commit this file with real values.
 
 # ---- Multi-target form (preferred since v0.3) ----
-# One ffmpeg process captures dshow once and tees to all targets. A slow or
-# dead receiver does not stall the others (per-output onfail=ignore).
+# One ffmpeg process captures dshow once and tees mic to all targets'
+# Port (default 9999). Per-output onfail=ignore so a slow/dead receiver
+# does not stall the others.
+#
+# PlaybackPort (default 10000) is where each Linux exposes its audio-out
+# stream; one ffplay child per target dials it and plays through the
+# Windows default playback device. The Windows audio engine mixes the N
+# concurrent streams natively.
 $LinuxTargets = @(
-    @{ Host = '192.0.2.10';  Port = 9999; HealthPort = 9998 },
-    @{ Host = '192.0.2.11';  Port = 9999; HealthPort = 9998 }
+    @{ Host = '192.0.2.10'; Port = 9999; HealthPort = 9998; PlaybackPort = 10000 },
+    @{ Host = '192.0.2.11'; Port = 9999; HealthPort = 9998; PlaybackPort = 10000 }
 )
 
 # ---- Legacy single-target form (still works) ----

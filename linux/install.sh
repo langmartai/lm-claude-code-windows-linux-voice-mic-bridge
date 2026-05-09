@@ -28,26 +28,39 @@ rm -f "$HOME/.config/systemd/user/windowsmic-watchdog.service"
 rm -f "$HOME/bin/windowsmic-watchdog.sh"
 
 # ---- install --------------------------------------------------------------
-install -m 755 bin/windowsmic-listen.sh   "$HOME/bin/"
-install -m 755 bin/windowsmic-health.py   "$HOME/bin/"
-install -m 644 systemd/windowsmic-listen.service "$HOME/.config/systemd/user/"
-install -m 644 systemd/windowsmic-health.service "$HOME/.config/systemd/user/"
+install -m 755 bin/windowsmic-listen.sh         "$HOME/bin/"
+install -m 755 bin/windowsmic-health.py         "$HOME/bin/"
+install -m 755 bin/windowsspeakers-export.sh    "$HOME/bin/"
+install -m 644 systemd/windowsmic-listen.service        "$HOME/.config/systemd/user/"
+install -m 644 systemd/windowsmic-health.service        "$HOME/.config/systemd/user/"
+install -m 644 systemd/windowsspeakers-export.service   "$HOME/.config/systemd/user/"
 
 if [ ! -f "$HOME/.config/windowsmic-bridge/config.env" ]; then
     install -m 600 config.example.env "$HOME/.config/windowsmic-bridge/config.env"
-    echo "==> Wrote default $HOME/.config/windowsmic-bridge/config.env (no secrets needed in v0.2)"
+    echo "==> Wrote default $HOME/.config/windowsmic-bridge/config.env (no secrets needed)"
 fi
 
-sudo install -m 644 pulse/windowsmic.pa /etc/pulse/default.pa.d/windowsmic.pa
-echo "==> pulse config installed; reload with: pulseaudio -k && pulseaudio --start"
+sudo install -m 644 pulse/windowsmic.pa        /etc/pulse/default.pa.d/windowsmic.pa
+sudo install -m 644 pulse/windowsspeakers.pa   /etc/pulse/default.pa.d/windowsspeakers.pa
+echo "==> pulse configs installed; reload with: pulseaudio -k && pulseaudio --start"
 
 sudo loginctl enable-linger "$USER" >/dev/null
 systemctl --user daemon-reload
-systemctl --user enable --now windowsmic-listen.service windowsmic-health.service
-systemctl --user --no-pager is-active windowsmic-listen.service windowsmic-health.service
+systemctl --user enable --now \
+    windowsmic-listen.service \
+    windowsmic-health.service \
+    windowsspeakers-export.service
+systemctl --user --no-pager is-active \
+    windowsmic-listen.service \
+    windowsmic-health.service \
+    windowsspeakers-export.service
 
 echo
 echo "==> Done. Verify with:"
-echo "    pactl list short sources | grep WindowsMic"
+echo "    pactl list short sources | grep -E 'WindowsMic|WindowsSpeakers'"
+echo "    pactl list short sinks   | grep WindowsSpeakers"
 echo "    curl -s http://127.0.0.1:9998/health | python3 -m json.tool"
 echo "    journalctl --user -u windowsmic-health.service -f"
+echo
+echo "==> Open inbound TCP 9999 (mic stream), 9998 (health), 10000 (playback)"
+echo "    on your host firewall and/or cloud security group from the Windows side."
