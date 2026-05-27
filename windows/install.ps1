@@ -13,6 +13,28 @@ $ErrorActionPreference = 'Stop'
 
 $dst = 'C:\windowsmic-bridge'
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+# ---- upgrade cleanup ----
+# Early installs put scripts in C:\temp\ and registered a per-user guardian
+# task at \Users\admin\WindowsMicGuardian. Newer installs use C:\windowsmic-bridge\
+# and the top-level \WindowsMicGuardian task. If both layouts co-exist, two
+# guardians run and two install copies of windowsmic.ps1 sit on disk -- the
+# guardian's process-name pattern matches either, so duplicate log entries
+# appear and stale C:\temp\ scripts may even get re-launched by scheduled
+# tasks pointing there. Remove the legacy artifacts on every install.
+foreach ($legacyTask in @('\Users\admin\WindowsMicGuardian')) {
+    $null = & schtasks /Delete /TN $legacyTask /F 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host ("==> removed legacy scheduled task {0}" -f $legacyTask)
+    }
+}
+foreach ($legacyFile in @('C:\temp\windowsmic.ps1','C:\temp\windowsmic-guardian.ps1')) {
+    if (Test-Path $legacyFile) {
+        $archived = "$legacyFile.removed-by-install-$(Get-Date -Format yyyyMMdd)"
+        Move-Item -Force $legacyFile $archived
+        Write-Host ("==> archived legacy install file {0} -> {1}" -f $legacyFile, $archived)
+    }
+}
 Copy-Item -Force "$PSScriptRoot\windowsmic.ps1"               "$dst\windowsmic.ps1"
 Copy-Item -Force "$PSScriptRoot\windowsmic-guardian.ps1"      "$dst\windowsmic-guardian.ps1"
 Copy-Item -Force "$PSScriptRoot\windowsmic-launcher.vbs"      "$dst\windowsmic-launcher.vbs"

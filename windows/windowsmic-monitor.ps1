@@ -75,7 +75,14 @@ if ($LinuxTargets.Count -eq 0) {
 $targetsDesc = ($LinuxTargets | ForEach-Object { "{0}:{1}" -f $_.Host, $_.HealthPort }) -join ', '
 Write-MLog ("monitor started, polling [{0}] every {1}s" -f $targetsDesc, $PollIntervalSec)
 
-$lastZombieAt = $null
+$lastZombieAt    = $null
+# Consecutive 30s kill cycles where zombie persisted across the kill. Used to
+# escalate from "kill ffmpeg" (which the streamer respawns within 1s, reopening
+# the same dshow handle if the handle itself is the broken thing) to "kill the
+# streamer PS too" -- the guardian's 60s reaper then rebuilds the whole chain,
+# giving the AG06 / dshow stack a multi-second gap to release the stuck handle.
+$EscalateAfterCycles = 3
+$zombieKillCycles    = 0
 
 while ($true) {
     # Poll every target. Any zombie_likely=true is enough to act -- the streamer
@@ -107,8 +114,9 @@ while ($true) {
     if ($reports.Count -gt 0) {
         $now = Get-Date
         if (-not $lastZombieAt -or ($now - $lastZombieAt).TotalSeconds -ge 30) {
+            $zombieKillCycles++
             foreach ($r in $reports) {
-                Write-MLog ("zombie_likely from {0} (peak={1}, streak={2}/{3})" -f $r.Host, $r.Peak, $r.Streak, $r.Limit)
+                Write-MLog ("zombie_likely from {0} (peak={1}, streak={2}/{3}, cycle={4})" -f $r.Host, $r.Peak, $r.Streak, $r.Limit, $zombieKillCycles)
             }
             $procs = @(Get-Process ffmpeg -ErrorAction SilentlyContinue)
             if ($procs.Count -eq 0) {
@@ -123,6 +131,25 @@ while ($true) {
                     }
                 }
             }
+
+            if ($zombieKillCycles -ge $EscalateAfterCycles) {
+                Write-MLog ("  escalating: {0} kill cycles without recovery -- also killing streamer PS so guardian rebuilds" -f $zombieKillCycles)
+                $streamers = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                              Where-Object { $_.CommandLine -and ($_.CommandLine -match 'windowsmic\.ps1') -and ($_.ProcessId -ne $PID) })
+                foreach ($s in $streamers) {
+                    try {
+                        Stop-Process -Id $s.ProcessId -Force -ErrorAction Stop
+                        Write-MLog ("    killed streamer PS PID {0}" -f $s.ProcessId)
+                    } catch {
+                        Write-MLog ("    kill streamer PID {0} failed: {1}" -f $s.ProcessId, $_.Exception.Message)
+                    }
+                }
+                # Reset so we don't escalate again on the next cycle; if the
+                # guardian's rebuild also fails to clear the zombie, the counter
+                # will climb back to threshold and escalate once more.
+                $zombieKillCycles = 0
+            }
+
             $lastZombieAt = $now
         }
     } else {
@@ -130,6 +157,7 @@ while ($true) {
             Write-MLog "all targets now report healthy stream"
             $lastZombieAt = $null
         }
+        $zombieKillCycles = 0
     }
     Start-Sleep -Seconds $PollIntervalSec
 }
